@@ -1,6 +1,6 @@
 # transformer-xray
 
-> Tested 2026-10-21 on GPT-2 small (openai-community/gpt2) on an Apple M3 Pro, torch 2.14.1, transformers 5.20.2, and on tiny random GPT-2 and Llama test models. Not yet run on a full-size Llama-style checkpoint.
+> Tested 2026-10-21 on GPT-2 small (openai-community/gpt2) on an Apple M3 Pro, torch 2.14.1, transformers 5.20.2, and on tiny random GPT-2 and Llama test models. Not yet run on a full-size Llama-style checkpoint. The --api mode is tested on recorded OpenAI and Anthropic responses, not yet on a live call.
 
 Companion to [What is a Transformer?](https://theaiengineer.substack.com/p/what-is-a-transformer), The AI Engineer.
 
@@ -100,6 +100,15 @@ A context that is about Poland but never names the capital leaves the trained an
 ```
 
 Run it on a question your RAG pipeline answers wrong. If the verdict says the answer came from training, the retrieved passage never reached the answer, so look at what you retrieved and where you put it in the prompt.
+
+## The model you ship: --api
+
+Closed models like GPT and Claude don't expose their blocks, so on them the tool answers the production question only: with your context, does the model give a different answer than without it? It calls the model 3 times on each side at temperature 0 and compares the majority answers. On OpenAI models it also prints the first answer token's probability with and without the context.
+
+    export OPENAI_API_KEY=...        # or ANTHROPIC_API_KEY
+    python3 transformer_xray.py "What is the capital of Poland?" --context retrieved.txt --api openai --model gpt-4o-mini
+
+The verdict reads "from the context" when the answers differ and "from training" when they match. Standard library only in this mode; torch is not needed.
 
 ## On your own prompt and model
 

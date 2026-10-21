@@ -169,6 +169,85 @@ def context_check(tok, model, context, prompt, out=print):
             "verdict": verdict, "top_block": share[0][1] + 1}
 
 
+# ------------------------------------------------------------------ API mode
+# Closed models expose no blocks, so this mode answers only the question that matters in production:
+# with your context, does the model you ship give a different answer than without it?
+# Standard library only. Keys come from OPENAI_API_KEY or ANTHROPIC_API_KEY.
+
+ASK = "Answer in as few words as possible."
+
+
+def _post(url, headers, body):
+    import json
+    import urllib.request
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode())
+
+
+def ask_api(provider, model, question, context=None, post=_post):
+    """(answer text, {token: probability} for the first answer token, or None) from one API call."""
+    import math
+    import os
+    text = (f"Context:\n{context.strip()}\n\nQuestion: {question}\n{ASK}" if context
+            else f"Question: {question}\n{ASK}")
+    if provider == "openai":
+        key = os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise ValueError("set OPENAI_API_KEY")
+        r = post("https://api.openai.com/v1/chat/completions",
+                 {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                 {"model": model, "messages": [{"role": "user", "content": text}], "temperature": 0,
+                  "max_tokens": 30, "logprobs": True, "top_logprobs": 5})
+        ch = r["choices"][0]
+        lp = (ch.get("logprobs") or {}).get("content") or []
+        first = {c["token"]: math.exp(c["logprob"]) for c in lp[0]["top_logprobs"]} if lp else None
+        return ch["message"]["content"].strip(), first
+    if provider == "anthropic":
+        key = os.environ.get("ANTHROPIC_API_KEY")
+        if not key:
+            raise ValueError("set ANTHROPIC_API_KEY")
+        r = post("https://api.anthropic.com/v1/messages",
+                 {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                 {"model": model, "max_tokens": 30, "temperature": 0,
+                  "messages": [{"role": "user", "content": text}]})
+        return "".join(b.get("text", "") for b in r["content"]).strip(), None
+    raise ValueError(f"unknown provider {provider!r}: use openai or anthropic")
+
+
+def _norm(s):
+    return " ".join(s.lower().strip(" .!\n\"'").split())
+
+
+def api_check(provider, model, question, context, runs=3, out=print, post=_post):
+    """Majority answer with and without the context, over `runs` calls each, and a verdict."""
+    from collections import Counter
+    res = {}
+    for label, ctx in (("with", context), ("without", None)):
+        answers, firsts = [], []
+        for _ in range(runs):
+            a, f = ask_api(provider, model, question, ctx, post)
+            answers.append(a)
+            firsts.append(f)
+        top, n = Counter(_norm(a) for a in answers).most_common(1)[0]
+        shown = next(a for a in answers if _norm(a) == top)
+        res[label] = (shown, n, firsts[0])
+    (aw, nw, fw), (ao, no, fo) = res["with"], res["without"]
+    out(f"transformer_xray · {provider} · {model} · {runs} calls each, temperature 0")
+    out(f"  with the context:     {aw!r}  ({nw} of {runs} calls)")
+    out(f"  without the context:  {ao!r}  ({no} of {runs} calls)")
+    if fw and fo:
+        tok = max(fw, key=fw.get)
+        out(f"  first answer token {tok!r}: {100 * fw[tok]:.1f}% with the context, "
+            f"{100 * fo.get(tok, 0):.1f}% without")
+    if _norm(aw) != _norm(ao):
+        verdict = "from the context: without it, the model gives a different answer"
+    else:
+        verdict = "from training: the model gives the same answer without the context"
+    out(f"  verdict: the answer comes {verdict}")
+    return {"with": aw, "without": ao, "verdict": verdict}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("prompt", help="the text the model continues")
@@ -176,10 +255,18 @@ def main(argv=None):
                     help="a hub id or a local folder (default: openai-community/gpt2)")
     ap.add_argument("--top", type=int, default=2, help="guesses shown per block (default 2)")
     ap.add_argument("--no-ablate", action="store_true", help="skip the feed-forward check")
+    ap.add_argument("--api", choices=["openai", "anthropic"],
+                    help="check a closed model through its API (needs --context and --model)")
+    ap.add_argument("--runs", type=int, default=3, help="API calls per side in --api mode (default 3)")
     ap.add_argument("--context", help="a text file with the context your app pastes before the prompt "
                     "(retrieved passages, a document); compares the answer with and without it")
     a = ap.parse_args(argv)
     try:
+        if a.api:
+            if not a.context or a.model == "openai-community/gpt2":
+                raise ValueError("--api needs --context FILE and --model, e.g. --model gpt-4o-mini")
+            api_check(a.api, a.model, a.prompt, open(a.context, encoding="utf-8").read(), a.runs)
+            return 0
         tok, model = load(a.model)
         if a.context:
             context = open(a.context, encoding="utf-8").read()
@@ -188,7 +275,7 @@ def main(argv=None):
             context_check(tok, model, context, a.prompt)
         else:
             inspect(tok, model, a.prompt, a.top, not a.no_ablate)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, KeyError) as e:
         print(f"transformer_xray: cannot run {a.model}: {e}", file=sys.stderr)
         return 1
     return 0

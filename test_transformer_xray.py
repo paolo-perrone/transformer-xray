@@ -75,3 +75,32 @@ class GPT2KnownAnswer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApiMode(unittest.TestCase):
+    """Recorded response shapes from the OpenAI and Anthropic APIs, no network."""
+
+    def fake(self, answer_with, answer_without):
+        def post(url, headers, body):
+            text = body["messages"][0]["content"]
+            ans = answer_with if text.startswith("Context:") else answer_without
+            if "openai" in url:
+                return {"choices": [{"message": {"content": ans},
+                                     "logprobs": {"content": [{"top_logprobs": [
+                                         {"token": ans.split()[0], "logprob": -0.1}]}]}}]}
+            return {"content": [{"type": "text", "text": ans}]}
+        return post
+
+    def setUp(self):
+        os.environ.setdefault("OPENAI_API_KEY", "test")
+        os.environ.setdefault("ANTHROPIC_API_KEY", "test")
+
+    def test_context_changes_the_answer(self):
+        r = tx.api_check("openai", "m", "What is the capital of Poland?", "The capital is Kraków.",
+                         runs=2, out=quiet, post=self.fake("Kraków", "Warsaw"))
+        self.assertTrue(r["verdict"].startswith("from the context"))
+
+    def test_same_answer_means_training(self):
+        r = tx.api_check("anthropic", "m", "What is the capital of Poland?", "Poland is in Europe.",
+                         runs=2, out=quiet, post=self.fake("Warsaw.", "warsaw"))
+        self.assertTrue(r["verdict"].startswith("from training"))
