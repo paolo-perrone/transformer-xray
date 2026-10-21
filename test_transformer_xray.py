@@ -55,6 +55,20 @@ class GPT2KnownAnswer(unittest.TestCase):
         self.assertAlmostEqual(p, 0.026, places=3)
         self.assertEqual(top, " the")
 
+    def test_wrong_fact_in_context_wins(self):
+        tok, m = tx.load(GPT2)
+        r = tx.context_check(tok, m, "The capital of Poland is Kraków.", "The capital of Poland is", out=quiet)
+        self.assertEqual(r["with"][0], " K")
+        self.assertEqual(r["without"][0], " Warsaw")
+        self.assertTrue(r["verdict"].startswith("from the context"))
+
+    def test_neutral_context_leaves_training_answer(self):
+        tok, m = tx.load(GPT2)
+        r = tx.context_check(tok, m, "Poland is a country in Central Europe with a population of about 37 million.",
+                             "The capital of Poland is", out=quiet)
+        self.assertEqual(r["with"][0], " Warsaw")
+        self.assertTrue(r["verdict"].startswith("from training"))
+
     def test_block_10_head_9_reads_poland(self):
         self.assertIn("block 10   head  9 puts 0.837 on ' Poland'", self.text)
 

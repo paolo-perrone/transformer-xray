@@ -4,12 +4,12 @@
 
 Companion to [What is a Transformer?](https://theaiengineer.substack.com/p/what-is-a-transformer), The AI Engineer.
 
-For engineers who call language models and want to see what one does with their own prompt: which word it is guessing after each block, where its answer comes from, and which part of the model the answer depends on.
+For engineers who build on language models and need to know where an answer came from: the context your app pasted in, or what the model learned in training. It also shows which word the model is guessing after each block, and which part of the model the answer depends on.
 
 It runs one forward pass of an open model on your prompt and prints the next-token guess after every block, the answer's probability after each attention step and each feed-forward step, the token each block's strongest attention head reads, and, when the answer comes from a feed-forward network, what happens when you switch that network off.
 
     pip install torch transformers
-    python3 transformer_xray.py "Your prompt here"
+    python3 transformer_xray.py "Your question" --context retrieved.txt
 
 Runs on a laptop CPU, no GPU and no API key. GPT-2 small by default; pass --model for any GPT-2-style or Llama-style model on the Hugging Face hub or on disk.
 
@@ -73,6 +73,34 @@ tokens        'The' 464 | ' capital' 3139 | ' of' 286 | ' Poland' 12873 | ' is' 
 
 " Warsaw" barely registers until block 10, rises most in block 11's feed-forward network, and falls to 2.6 percent when that network is switched off. The prompt never says Warsaw, so the capital comes from what GPT-2 learned in training.
 
+## Did the answer come from your context or from training?
+
+If your app pastes retrieved passages or a document before the question, pass them with --context. It runs the prompt with and without them and tells you which one the answer came from.
+
+    python3 transformer_xray.py "The capital of Poland is" --context examples/wrong_fact.txt
+
+A context that says the capital is Kraków changes the answer:
+
+```
+5. context or training? (11 context tokens)
+  with the context:     ' K' at 67.2%
+  without the context:  ' Warsaw' at 10.3%, and ' K' at 0.3%
+  verdict: the answer comes from the context: without it, the model writes a different answer
+  blocks whose attention reads the context most (average share over heads): block 1 40%, block 2 38%, block 12 33%
+```
+
+A context that is about Poland but never names the capital leaves the trained answer in place, and only makes the model surer of it:
+
+```
+5. context or training? (17 context tokens)
+  with the context:     ' Warsaw' at 27.0%
+  without the context:  ' Warsaw' at 10.3%
+  verdict: the answer comes from training, and the context backs it up: +16.7 points for the same answer
+  blocks whose attention reads the context most (average share over heads): block 1 47%, block 2 45%, block 3 22%
+```
+
+Run it on a question your RAG pipeline answers wrong. If the verdict says the answer came from training, the retrieved passage never reached the answer, so look at what you retrieved and where you put it in the prompt.
+
 ## On your own prompt and model
 
     python3 transformer_xray.py "Your prompt" --model Qwen/Qwen2.5-0.5B
@@ -103,7 +131,7 @@ Standard-library Python. See `python3 kv_cache.py --help`.
 
     python3 -m unittest test_transformer_xray test_kv_cache -v
 
-The GPT-2 test checks the numbers above: " Warsaw" at 10.3 percent, the biggest rise in block 11's feed-forward network, 2.6 percent with it switched off, and block 10's head 9 putting 0.837 on " Poland".
+The GPT-2 tests check the numbers above, the Kraków context changing the answer and the neutral one leaving it: " Warsaw" at 10.3 percent, the biggest rise in block 11's feed-forward network, 2.6 percent with it switched off, and block 10's head 9 putting 0.837 on " Poland".
 
 ## Support
 

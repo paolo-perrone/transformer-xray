@@ -15,4 +15,5 @@ jobs:
       - run: python -m pip install transformers
       - run: python -m unittest test_transformer_xray test_kv_cache -v
       - run: python transformer_xray.py "The capital of Poland is"
+      - run: python transformer_xray.py "The capital of Poland is" --context examples/wrong_fact.txt --no-ablate
       - run: python kv_cache.py fixtures/deepseek-v3.json

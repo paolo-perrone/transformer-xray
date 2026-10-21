@@ -10,6 +10,8 @@ For one forward pass on your prompt it prints:
      each block's feed-forward network, and the step where it rises most
   3. for each block, the attention head that pulls the most into the last token, and from where
   4. when the biggest rise is a feed-forward network, it switches that network off and runs again
+  5. with --context FILE: whether the answer comes from that context or from training, by running
+     the prompt with and without it, and which blocks read the context most
 
 Runs on a laptop CPU. Needs torch and transformers (pip install torch transformers). Works with
 GPT-2-style and Llama-style models from the Hugging Face hub (GPT-2, Llama, Qwen, Mistral, SmolLM).
@@ -129,6 +131,44 @@ def inspect(tok, model, prompt, top=2, ablate=True, out=print):
     return result
 
 
+def context_check(tok, model, context, prompt, out=print):
+    """Did the answer come from the context or from training? Runs the prompt with and without it."""
+    import torch
+    blocks, _norm, _head = parts(model)
+    c_ids = tok(context.rstrip() + "\n", return_tensors="pt").input_ids[0]
+    p_ids = tok(prompt, return_tensors="pt").input_ids[0]
+    both = torch.cat([c_ids, p_ids]).unsqueeze(0)
+    with torch.no_grad():
+        w = model(both, output_attentions=True)
+        wo = model(p_ids.unsqueeze(0))
+    pw, po = w.logits[0, -1].softmax(-1), wo.logits[0, -1].softmax(-1)
+    a_w, a_o = int(pw.argmax()), int(po.argmax())
+    out("")
+    out(f"5. context or training? ({len(c_ids)} context tokens)")
+    out(f"  with the context:     {piece(tok, a_w)} at {100 * float(pw[a_w]):.1f}%")
+    extra = "" if a_o == a_w else f", and {piece(tok, a_w)} at {100 * float(po[a_w]):.1f}%"
+    out(f"  without the context:  {piece(tok, a_o)} at {100 * float(po[a_o]):.1f}%{extra}")
+    gain = float(pw[a_w]) - float(po[a_w])
+    if a_w != a_o:
+        verdict = "from the context: without it, the model writes a different answer"
+    elif gain >= 0.10:
+        verdict = (f"from training, and the context backs it up: +{100 * gain:.1f} points "
+                   "for the same answer")
+    else:
+        verdict = "from training: the model writes the same answer without the context"
+    out(f"  verdict: the answer comes {verdict}")
+    n_ctx = len(c_ids)
+    share = []
+    for b, att in enumerate(w.attentions):
+        row = att[0, :, -1, :]                        # heads x tokens, for the last token
+        share.append((float(row[:, 1:n_ctx].sum(-1).mean()), b))   # first token left out
+    share.sort(reverse=True)
+    out("  blocks whose attention reads the context most (average share over heads): " +
+        ", ".join(f"block {b + 1} {100 * s:.0f}%" for s, b in share[:3]))
+    return {"with": (tok.decode([a_w]), float(pw[a_w])), "without": (tok.decode([a_o]), float(po[a_o])),
+            "verdict": verdict, "top_block": share[0][1] + 1}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("prompt", help="the text the model continues")
@@ -136,10 +176,18 @@ def main(argv=None):
                     help="a hub id or a local folder (default: openai-community/gpt2)")
     ap.add_argument("--top", type=int, default=2, help="guesses shown per block (default 2)")
     ap.add_argument("--no-ablate", action="store_true", help="skip the feed-forward check")
+    ap.add_argument("--context", help="a text file with the context your app pastes before the prompt "
+                    "(retrieved passages, a document); compares the answer with and without it")
     a = ap.parse_args(argv)
     try:
         tok, model = load(a.model)
-        inspect(tok, model, a.prompt, a.top, not a.no_ablate)
+        if a.context:
+            context = open(a.context, encoding="utf-8").read()
+            full = context.rstrip() + "\n" + a.prompt
+            inspect(tok, model, full, a.top, not a.no_ablate)
+            context_check(tok, model, context, a.prompt)
+        else:
+            inspect(tok, model, a.prompt, a.top, not a.no_ablate)
     except (OSError, ValueError) as e:
         print(f"transformer_xray: cannot run {a.model}: {e}", file=sys.stderr)
         return 1
