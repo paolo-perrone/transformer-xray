@@ -1,86 +1,62 @@
-"""Known answers for transformer_xray, each one reconstructible by hand from the config."""
-import io
+"""Known answers for transformer_xray.
+
+The layout tests run on tiny random models (seconds, no real weights). The GPT-2 test runs the
+real openai-community/gpt2 on "The capital of Poland is" and checks the numbers the issue prints.
+"""
 import os
 import unittest
-from contextlib import redirect_stdout
 
 import transformer_xray as tx
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+GPT2 = os.environ.get("GPT2", "openai-community/gpt2")
 
 
-def model(name):
-    c, _folder, _label = tx.load(os.path.join(HERE, "fixtures", name + ".json"))
-    return tx.Model(c)
+def quiet(_):
+    pass
 
 
-def run(*argv):
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        code = tx.main(list(argv))
-    return code, buf.getvalue()
+class Layouts(unittest.TestCase):
+    def test_gpt2_layout_runs(self):
+        tok, m = tx.load("hf-internal-testing/tiny-random-gpt2")
+        r = tx.inspect(tok, m, "The capital of Poland is", out=quiet)
+        self.assertTrue(r["tokens"])
+
+    def test_llama_layout_runs(self):
+        tok, m = tx.load("hf-internal-testing/tiny-random-LlamaForCausalLM")
+        r = tx.inspect(tok, m, "The capital of Poland is", out=quiet)
+        self.assertTrue(r["tokens"])
+
+    def test_unknown_layout_is_refused(self):
+        class Odd:
+            pass
+        with self.assertRaises(ValueError):
+            tx.parts(Odd())
 
 
-class Weights(unittest.TestCase):
-    def test_gpt2_matches_its_weights_file(self):
-        # 124,439,808 is the tensor count of openai-community/gpt2's model.safetensors,
-        # causal-mask buffers left out.
-        self.assertEqual(sum(model("gpt2").weights().values()), 124_439_808)
+class GPT2KnownAnswer(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tok, m = tx.load(GPT2)
+        lines = []
+        cls.r = tx.inspect(tok, m, "The capital of Poland is", out=lines.append)
+        cls.text = "\n".join(lines)
 
-    def test_llama_3_70b(self):
-        self.assertEqual(sum(model("llama-3-70b").weights().values()), 70_553_706_496)
+    def test_answer_and_probability(self):
+        self.assertEqual(self.r["best"], " Warsaw")
+        self.assertAlmostEqual(self.r["p_best"], 0.103, places=3)
 
-    def test_gemma_2_9b(self):
-        self.assertEqual(sum(model("gemma-2-9b").weights().values()), 9_241_705_984)
+    def test_biggest_rise_is_block_11_feed_forward(self):
+        kind, block, up = self.r["rise"]
+        self.assertEqual((kind, block), ("feed-forward network", 11))
+        self.assertAlmostEqual(up, 0.250, places=2)
 
-    def test_mixture_of_experts_is_not_guessed(self):
-        self.assertIsNone(model("deepseek-v3").weights())
+    def test_switching_it_off_drops_warsaw(self):
+        p, top, ptop = self.r["ablated"]
+        self.assertAlmostEqual(p, 0.026, places=3)
+        self.assertEqual(top, " the")
 
-
-class Cache(unittest.TestCase):
-    def test_llama_shares_8_key_value_heads(self):
-        # 2 (keys, values) x 80 blocks x 8 heads x 128 numbers x 2 bytes
-        self.assertEqual(model("llama-3-70b").cache_bytes(1), 327_680)
-
-    def test_deepseek_stores_a_576_number_latent(self):
-        # (512 + 64) numbers x 61 blocks x 2 bytes
-        self.assertEqual(model("deepseek-v3").cache_bytes(1), 70_272)
-
-    def test_gemma_sliding_blocks_stop_at_4096(self):
-        m = model("gemma-2-9b")
-        per_block = 2 * 8 * 256 * 2
-        self.assertEqual(m.cache_bytes(8192), 21 * per_block * 8192 + 21 * per_block * 4096)
-
-    def test_granite_caches_only_its_4_attention_blocks(self):
-        self.assertEqual(model("granite-4.0-h-small").cache_bytes(1), 4 * 2 * 8 * 128 * 2)
-
-    def test_gpt2_is_float32(self):
-        self.assertEqual(model("gpt2").cache_bytes(1), 2 * 12 * 768 * 4)
-
-
-class Output(unittest.TestCase):
-    def test_the_forum_request_is_over_the_window(self):
-        code, out = run(os.path.join(HERE, "fixtures", "llama-3-70b.json"), "--tokens", "1750", "--answer", "8100")
-        self.assertEqual(code, 3)
-        self.assertIn("1,750 prompt + 8,100 answer = 9,850, over the 8,192-token window by 1,658", out)
-
-    def test_gemma_on_a_24_gb_card(self):
-        code, out = run(os.path.join(HERE, "fixtures", "gemma-2-9b.json"), "--tokens", "8192", "--gpu-gb", "24")
-        self.assertEqual(code, 0)
-        self.assertIn("2 conversations of 8,192 tokens fit", out)
-
-    def test_deepseek_names_the_overcount(self):
-        _code, out = run(os.path.join(HERE, "fixtures", "deepseek-v3.json"))
-        self.assertIn("71.1 times too much", out)
-
-    def test_estimate_is_labeled(self):
-        p = os.path.join(HERE, "fixtures", "prompt.txt")
-        _code, out = run(os.path.join(HERE, "fixtures", "gpt2.json"), "--prompt", p)
-        self.assertIn("estimate at 4 characters per token", out)
-
-    def test_unreadable_input_exits_1(self):
-        code, _out = run(os.path.join(HERE, "fixtures", "missing.json"))
-        self.assertEqual(code, 1)
+    def test_block_10_head_9_reads_poland(self):
+        self.assertIn("block 10   head  9 puts 0.837 on ' Poland'", self.text)
 
 
 if __name__ == "__main__":

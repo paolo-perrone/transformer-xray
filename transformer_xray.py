@@ -1,262 +1,149 @@
 #!/usr/bin/env python3
-"""transformer_xray: what one model's transformer costs you, read from its config.json.
+"""transformer_xray: watch a transformer write the next word of YOUR prompt, block by block.
 
-    python3 transformer_xray.py <config.json | model folder | hub id> [--prompt FILE | --tokens N]
-                                [--answer N] [--gpu-gb G] [--conversations C]
+    python3 transformer_xray.py "The capital of Poland is"
+    python3 transformer_xray.py "Your own prompt" --model Qwen/Qwen2.5-0.5B
 
-It reads the configuration file a model ships with and prints:
-  1. the blocks: how many, how wide, and how attention shares its keys and values
-  2. where the weights sit (dense models): feed-forward, attention, token tables
-  3. the key-value cache per token, counted block by block, so shared key-value heads,
-     compressed latents, sliding-window blocks and Mamba blocks are each counted as they are
-  4. your prompt: its tokens, its cache, and whether prompt plus answer fits the window
-  5. with --gpu-gb: how many conversations of your length fit beside the weights
+For one forward pass on your prompt it prints:
+  1. the model's best guess for the next token after every block (read through the final layer)
+  2. where the final answer comes from: its probability after each block's attention and after
+     each block's feed-forward network, and the step where it rises most
+  3. for each block, the attention head that pulls the most into the last token, and from where
+  4. when the biggest rise is a feed-forward network, it switches that network off and runs again
 
-Standard library only. The token count is exact when the `tokenizers` package is installed
-and a tokenizer.json sits beside the config; otherwise it says it is an estimate.
-Exit 0 when the prompt fits, 3 when prompt plus answer is over the window, 1 on an input
-it cannot read.
+Runs on a laptop CPU. Needs torch and transformers (pip install torch transformers). Works with
+GPT-2-style and Llama-style models from the Hugging Face hub (GPT-2, Llama, Qwen, Mistral, SmolLM).
+Exit 0 on success, 1 on a model or prompt it cannot run.
 """
 import argparse
-import json
-import math
-import os
 import sys
-import urllib.request
-
-DTYPE_BYTES = {"float32": 4, "float16": 2, "bfloat16": 2, "float8_e4m3fn": 1}
 
 
-# ------------------------------------------------------------------ reading the config
-def load(src):
-    """(config, folder or None, label). src is a config.json, a folder holding one, or a hub id."""
-    if os.path.isdir(src):
-        path = os.path.join(src, "config.json")
-        return json.load(open(path, encoding="utf-8")), src, os.path.basename(os.path.abspath(src))
-    if os.path.isfile(src):
-        return json.load(open(src, encoding="utf-8")), os.path.dirname(os.path.abspath(src)), os.path.basename(src)
-    if src.count("/") == 1 and not src.startswith((".", "/")):
-        url = f"https://huggingface.co/{src}/resolve/main/config.json"
+def load(name):
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(name)
+    model = AutoModelForCausalLM.from_pretrained(name, attn_implementation="eager",
+                                                 dtype=torch.float32)
+    model.eval()
+    return tok, model
+
+
+def parts(model):
+    """(blocks, final_norm, output_layer) for the two layouts most open models use."""
+    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):        # GPT-2 style
+        return model.transformer.h, model.transformer.ln_f, model.lm_head
+    if hasattr(model, "model") and hasattr(model.model, "layers"):               # Llama style
+        return model.model.layers, model.model.norm, model.lm_head
+    raise ValueError("unknown layout: this tool reads GPT-2-style and Llama-style models")
+
+
+def piece(tok, i):
+    return repr(tok.decode([int(i)]))
+
+
+def guess(model, norm, head, h):
+    """Probabilities for the next token from one hidden row, read through the final layer."""
+    return head(norm(h)).softmax(-1)
+
+
+def attn_module(blk):
+    return blk.attn if hasattr(blk, "attn") else blk.self_attn
+
+
+def inspect(tok, model, prompt, top=2, ablate=True, out=print):
+    import torch
+    blocks, norm, head = parts(model)
+    ids = tok(prompt, return_tensors="pt").input_ids
+    toks = [tok.decode([i]) for i in ids[0]]
+    attn_out = {}
+    hooks = [attn_module(b).register_forward_hook(
+        lambda m, i, o, k=k: attn_out.__setitem__(k, o[0] if isinstance(o, tuple) else o))
+        for k, b in enumerate(blocks)]
+    try:
+        with torch.no_grad():
+            res = model(ids, output_hidden_states=True, output_attentions=True)
+    finally:
+        for h in hooks:
+            h.remove()
+    probs = res.logits[0, -1].softmax(-1)
+    best = int(probs.argmax())
+    n = len(blocks)
+    name = getattr(model.config, "_name_or_path", "model")
+    out(f"transformer_xray · {name} · {n} blocks · {len(toks)} tokens")
+    out("tokens        " + " | ".join(f"{t!r} {int(i)}" for t, i in zip(toks, ids[0])))
+
+    def lens(h, last=False):
+        # The final hidden state already has the final norm applied (GPT-2 and Llama layouts).
+        return (head(h) if last else head(norm(h))).softmax(-1)
+
+    out("")
+    out("1. the next-token guess after each block")
+    with torch.no_grad():
+        for b in range(n):
+            p = lens(res.hidden_states[b + 1][0, -1], last=b == n - 1)
+            vals, idx = p.topk(top)
+            row = "  ".join(f"{piece(tok, i):>12} {100 * v:5.1f}%" for v, i in zip(vals, idx))
+            out(f"  block {b + 1:>2}   {row}")
+
+    out("")
+    out(f"2. where {piece(tok, best)} comes from: its probability after each step")
+    out("  block   after attention   after feed-forward")
+    rises = []
+    with torch.no_grad():
+        for b in range(n):
+            pre = float(lens(res.hidden_states[b][0, -1])[best]) if b else 0.0
+            mid_h = res.hidden_states[b][0, -1] + attn_out[b][0, -1]
+            mid = float(lens(mid_h)[best])
+            post = float(lens(res.hidden_states[b + 1][0, -1], last=b == n - 1)[best])
+            rises.append((mid - pre, "attention", b))
+            rises.append((post - mid, "feed-forward network", b))
+            out(f"  {b + 1:>5}   {100 * mid:13.1f}%   {100 * post:16.1f}%")
+    up, kind, b = max(rises)
+    out(f"  biggest rise: block {b + 1}'s {kind}, +{100 * up:.1f} points")
+
+    out("")
+    out("3. attention into the last token, first token left out (it soaks up spare attention)")
+    for k, att in enumerate(res.attentions):
+        row = att[0, :, -1, 1:] if len(toks) > 1 else att[0, :, -1, :]
+        share, tokidx = row.max(-1)
+        h = int(share.argmax())
+        t = int(tokidx[h]) + (1 if len(toks) > 1 else 0)
+        out(f"  block {k + 1:>2}   head {h + 1:>2} puts {float(share[h]):.3f} on {toks[t]!r}")
+
+    result = {"tokens": toks, "best": tok.decode([best]), "p_best": float(probs[best]),
+              "rise": (kind, b + 1, up)}
+    if ablate and kind == "feed-forward network":
+        hook = blocks[b].mlp.register_forward_hook(lambda m, i, o: torch.zeros_like(o))
         try:
-            with urllib.request.urlopen(url, timeout=30) as r:
-                return json.loads(r.read().decode("utf-8")), None, src
-        except Exception as e:
-            raise ValueError(f"could not fetch {url}: {e}. A gated model needs its config.json "
-                             f"downloaded first; pass the file instead.")
-    raise ValueError(f"{src}: not a config.json, a folder holding one, or a hub id like owner/name")
-
-
-def g(c, *keys, default=None):
-    for k in keys:
-        if c.get(k) is not None:
-            return c[k]
-    return default
-
-
-class Model:
-    def __init__(self, c):
-        self.c = c
-        self.kind = c.get("model_type", "unknown")
-        self.layers = g(c, "num_hidden_layers", "n_layer")
-        self.width = g(c, "hidden_size", "n_embd")
-        self.heads = g(c, "num_attention_heads", "n_head")
-        if not (self.layers and self.width and self.heads):
-            raise ValueError("the config names no layer count, width or head count, so this is not a "
-                             "transformer config this tool can read")
-        self.kv_heads = g(c, "num_key_value_heads", default=self.heads)
-        self.head_dim = g(c, "head_dim", default=self.width // self.heads)
-        self.window = g(c, "max_position_embeddings", "n_positions", "max_sequence_length")
-        self.vocab = g(c, "vocab_size")
-        dtype = g(c, "torch_dtype", "dtype", default="float32" if self.kind == "gpt2" else "bfloat16")
-        self.dtype = str(dtype).replace("torch.", "")
-        self.bytes = DTYPE_BYTES.get(self.dtype, 2)
-        self.types = self.layer_types()
-
-    def layer_types(self):
-        """One entry per block: full, sliding, latent (compressed keys and values) or mamba."""
-        c = self.c
-        lt = c.get("layer_types") or c.get("layers_block_type")
-        if c.get("kv_lora_rank"):
-            return ["latent"] * self.layers
-        if lt:
-            m = {"full_attention": "full", "attention": "full", "sliding_attention": "sliding",
-                 "mamba": "mamba", "linear_attention": "mamba"}
-            return [m.get(x, "full") for x in lt][:self.layers]
-        if c.get("sliding_window") and c.get("use_sliding_window", True) and self.kind in ("mistral",):
-            return ["sliding"] * self.layers
-        return ["full"] * self.layers
-
-    # -------------------------------------------------------------- the cache
-    def numbers_per_token(self, t):
-        """Numbers one block stores per token in the key-value cache."""
-        if t == "mamba":
-            return 0
-        if t == "latent":
-            return self.c["kv_lora_rank"] + self.c.get("qk_rope_head_dim", 0)
-        return 2 * self.kv_heads * self.head_dim
-
-    def cache_bytes(self, tokens):
-        """Cache bytes for one conversation of `tokens` tokens, block by block."""
-        win = self.c.get("sliding_window") or 0
-        total = 0
-        for t in self.types:
-            held = min(tokens, win) if (t == "sliding" and win) else tokens
-            total += self.numbers_per_token(t) * held
-        return total * self.bytes
-
-    def naive_cache_bytes(self, tokens):
-        """The textbook formula: every block keeps full keys and values for every head."""
-        kdim = self.head_dim
-        if self.c.get("kv_lora_rank"):
-            kdim = self.c.get("qk_nope_head_dim", 0) + self.c.get("qk_rope_head_dim", 0)
-        vdim = self.c.get("v_head_dim", self.head_dim)
-        return self.layers * self.heads * (kdim + vdim) * tokens * self.bytes
-
-    # -------------------------------------------------------------- the weights
-    def weights(self):
-        """{part: count} for dense layouts this tool can count exactly, else None."""
-        c, H, L = self.c, self.width, self.layers
-        q, kv = self.heads * self.head_dim, self.kv_heads * self.head_dim
-        if self.kind == "gpt2":
-            ff = g(c, "n_inner", default=4 * H)
-            att = (H * 3 * H + 3 * H) + (H * H + H)
-            mlp = (H * ff + ff) + (ff * H + H)
-            norms = L * 4 * H + 2 * H
-            tables = self.vocab * H + self.window * H
-            return {"feed-forward": L * mlp, "attention": L * att, "token tables": tables, "norms": norms}
-        if self.kind in ("llama", "mistral", "qwen2", "qwen3", "gemma2", "gemma"):
-            if any(g(c, k) for k in ("num_local_experts", "num_experts", "n_routed_experts")):
-                return None
-            ff = c["intermediate_size"]
-            bias = (q + 2 * kv) if (c.get("attention_bias") or self.kind == "qwen2") else 0
-            att = H * q + 2 * H * kv + q * H + bias
-            if self.kind == "qwen3":
-                att += 2 * self.head_dim            # q_norm and k_norm
-            mlp = 3 * H * ff
-            per_norms = 4 if self.kind == "gemma2" else 2
-            norms = L * per_norms * H + H
-            tied = c.get("tie_word_embeddings", self.kind.startswith("gemma"))
-            tables = self.vocab * H * (1 if tied else 2)
-            return {"feed-forward": L * mlp, "attention": L * att, "token tables": tables, "norms": norms}
-        return None
-
-
-# ------------------------------------------------------------------ the prompt
-def count_tokens(text, folder):
-    """(count, how). Exact with `tokenizers` and a tokenizer.json, else an estimate."""
-    tj = os.path.join(folder, "tokenizer.json") if folder else None
-    if tj and os.path.exists(tj):
-        try:
-            from tokenizers import Tokenizer
-            return len(Tokenizer.from_file(tj).encode(text, add_special_tokens=False).ids), "tokenizer.json"
-        except ImportError:
-            pass
-    return math.ceil(len(text) / 4), "estimate at 4 characters per token: pip install tokenizers and put tokenizer.json beside the config for the exact count"
-
-
-# ------------------------------------------------------------------ output
-def gb(b):
-    return f"{b / 1e9:,.2f} GB"
-
-
-def report(m, label, prompt_tokens=None, how=None, answer=0, gpu_gb=None, conversations=1, out=print):
-    out(f"transformer_xray · {label} ({m.kind})")
-    n = len(m.types)
-    kinds = {t: m.types.count(t) for t in ("full", "sliding", "latent", "mamba") if t in m.types}
-    shape = f"{m.layers} blocks, {m.width:,} wide, {m.heads} query heads"
-    if "latent" in kinds:
-        shape += f", keys and values compressed to {m.numbers_per_token('latent')} numbers per token"
-    elif m.kv_heads != m.heads:
-        shape += f" sharing {m.kv_heads} key-value heads"
-    out(f"blocks        {shape}")
-    if len(kinds) > 1:
-        parts = []
-        if "full" in kinds:
-            parts.append(f"{kinds['full']} read the whole context")
-        if "sliding" in kinds:
-            parts.append(f"{kinds['sliding']} read the last {m.c.get('sliding_window'):,} tokens")
-        if "latent" in kinds:
-            parts.append(f"{kinds['latent']} store a compressed latent")
-        if "mamba" in kinds:
-            parts.append(f"{kinds['mamba']} are Mamba, with a fixed-size state and no per-token cache")
-        out(f"              of {n}: " + ", ".join(parts))
-    out(f"window        {m.window:,} tokens" if m.window else "window        not stated in the config")
-
-    w = m.weights()
-    if w:
-        total = sum(w.values())
-        split = ", ".join(f"{k} {100 * v / total:.1f}%" for k, v in w.items() if k != "norms")
-        out(f"weights       {total:,} ({split}); {gb(total * m.bytes)} in {m.dtype}")
-    else:
-        out("weights       not counted for this layout (mixture of experts or hybrid); the cache below still is")
-
-    per = m.cache_bytes(1)
-    naive = m.naive_cache_bytes(1)
-    line = f"cache         {per:,} bytes per token ({m.dtype})"
-    if naive > per * 1.05:
-        line += f"; the full-heads formula says {naive:,}, {naive / per:.1f} times too much"
-    out(line)
-    if m.window:
-        out(f"              {gb(m.cache_bytes(m.window))} for one conversation at the full window")
-
-    code = 0
-    if prompt_tokens is not None:
-        out(f"prompt        {prompt_tokens:,} tokens ({how})")
-        out(f"              {gb(m.cache_bytes(prompt_tokens))} of cache, "
-            f"{prompt_tokens * (prompt_tokens + 1) // 2:,} attention scores per head per full block")
-        need = prompt_tokens + answer
-        if m.window and need > m.window:
-            out(f"fits          NO: {prompt_tokens:,} prompt + {answer:,} answer = {need:,}, "
-                f"over the {m.window:,}-token window by {need - m.window:,}")
-            code = 3
-        elif m.window:
-            out(f"fits          yes: {need:,} of {m.window:,} tokens, {m.window - need:,} to spare")
-    if gpu_gb is not None:
-        length = (prompt_tokens or 0) + answer if prompt_tokens is not None else (m.window or 0)
-        wbytes = sum(w.values()) * m.bytes if w else None
-        if code == 3:
-            out("gpu           not counted: no conversation of this length runs, since it is over the window")
-        elif wbytes is None:
-            out("gpu           weights not counted, so the space they leave is unknown")
-        else:
-            left = gpu_gb * 1e9 - wbytes
-            each = m.cache_bytes(length)
-            if left <= 0:
-                out(f"gpu           the weights alone, {gb(wbytes)}, do not fit in {gpu_gb:g} GB")
-            else:
-                fit = int(left // each) if each else 0
-                out(f"gpu           {gpu_gb:g} GB minus {gb(wbytes)} of weights leaves {gb(left)}: "
-                    f"{fit:,} conversations of {length:,} tokens fit")
-                if conversations > fit:
-                    out(f"              you asked for {conversations:,}: short by {conversations - fit:,}")
-    return code
+            with torch.no_grad():
+                q = model(ids).logits[0, -1].softmax(-1)
+        finally:
+            hook.remove()
+        nb = int(q.argmax())
+        out("")
+        out(f"4. check: switch off block {b + 1}'s feed-forward network and run again")
+        out(f"  {piece(tok, best)} {100 * float(probs[best]):.1f}% -> {100 * float(q[best]):.1f}%, "
+            f"top guess becomes {piece(tok, nb)} at {100 * float(q[nb]):.1f}%")
+        result["ablated"] = (float(q[best]), tok.decode([nb]), float(q[nb]))
+    return result
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("model", help="config.json, a folder holding one, or a hub id like openai-community/gpt2")
-    p.add_argument("--prompt", help="a text file holding the prompt you send")
-    p.add_argument("--tokens", type=int, help="prompt length in tokens, when you know it")
-    p.add_argument("--answer", type=int, default=0, help="tokens you reserve for the answer (max_tokens)")
-    p.add_argument("--gpu-gb", type=float, help="GPU memory in GB, to count conversations that fit")
-    p.add_argument("--conversations", type=int, default=1, help="conversations you want to serve at once")
-    a = p.parse_args(argv)
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("prompt", help="the text the model continues")
+    ap.add_argument("--model", default="openai-community/gpt2",
+                    help="a hub id or a local folder (default: openai-community/gpt2)")
+    ap.add_argument("--top", type=int, default=2, help="guesses shown per block (default 2)")
+    ap.add_argument("--no-ablate", action="store_true", help="skip the feed-forward check")
+    a = ap.parse_args(argv)
     try:
-        c, folder, label = load(a.model)
-        m = Model(c)
-    except (OSError, ValueError, KeyError) as e:
-        print(f"transformer_xray: cannot read {a.model}: {e}", file=sys.stderr)
+        tok, model = load(a.model)
+        inspect(tok, model, a.prompt, a.top, not a.no_ablate)
+    except (OSError, ValueError) as e:
+        print(f"transformer_xray: cannot run {a.model}: {e}", file=sys.stderr)
         return 1
-    tokens, how = a.tokens, "given"
-    if a.prompt:
-        try:
-            text = open(a.prompt, encoding="utf-8").read()
-        except OSError as e:
-            print(f"transformer_xray: cannot read {a.prompt}: {e}", file=sys.stderr)
-            return 1
-        tokens, how = count_tokens(text, folder)
-        how = f"{os.path.basename(a.prompt)}, {how}"
-    return report(m, label, tokens, how, a.answer, a.gpu_gb, a.conversations)
+    return 0
 
 
 if __name__ == "__main__":

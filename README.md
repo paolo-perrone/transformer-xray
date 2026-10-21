@@ -1,27 +1,95 @@
 # transformer-xray
 
-> Tested on 5 shipped config.json files (GPT-2, Llama 3 70B, Gemma 2 9B, DeepSeek-V3, Granite 4.0-H Small) on 2026-10-21 with Python 3.14; CI runs 3.9, 3.12 and 3.13. Weight totals match the published counts for the 3 dense models. Not yet run on a mixture-of-experts weight count, which it declines to guess.
+> Tested 2026-10-21 on GPT-2 small (openai-community/gpt2) on an Apple M3 Pro, torch 2.14.1, transformers 5.20.2, and on tiny random GPT-2 and Llama test models. Not yet run on a full-size Llama-style checkpoint.
 
 Companion to [What is a Transformer?](https://theaiengineer.substack.com/p/what-is-a-transformer), The AI Engineer.
 
-For engineers who serve or call a language model and need to know, before the bill or the out-of-memory error, how much GPU memory each conversation takes and whether a prompt fits.
+For engineers who call language models and want to see what one does with their own prompt: which word it is guessing after each block, where its answer comes from, and which part of the model the answer depends on.
 
-It reads the config.json your model already ships with and counts the key-value cache block by block: shared key-value heads, compressed latents, sliding-window blocks and Mamba blocks each counted as they are. Then it checks your prompt against the window, and with --gpu-gb, counts how many conversations of your length fit beside the weights.
+It runs one forward pass of an open model on your prompt and prints the next-token guess after every block, the answer's probability after each attention step and each feed-forward step, the token each block's strongest attention head reads, and, when the answer comes from a feed-forward network, what happens when you switch that network off.
 
-    python3 transformer_xray.py path/to/config.json --prompt my_prompt.txt --answer 1024 --gpu-gb 80
+    pip install torch transformers
+    python3 transformer_xray.py "Your prompt here"
 
-One file, standard-library Python, no GPU and no API key. Exit 0 when the prompt fits, 3 when prompt plus answer is over the window, 1 on an input it cannot read.
+Runs on a laptop CPU, no GPU and no API key. GPT-2 small by default; pass --model for any GPT-2-style or Llama-style model on the Hugging Face hub or on disk.
 
-## What it prints, on cases with a known answer
-
-DeepSeek-V3 stores a compressed latent where the textbook formula assumes full keys and values for all 128 heads:
-
-```
-python3 transformer_xray.py fixtures/deepseek-v3.json
-```
+## What it prints, on the issue's example
 
 ```
-transformer_xray · deepseek-v3.json (deepseek_v3)
+python3 transformer_xray.py "The capital of Poland is"
+```
+
+```
+transformer_xray · openai-community/gpt2 · 12 blocks · 5 tokens
+tokens        'The' 464 | ' capital' 3139 | ' of' 286 | ' Poland' 12873 | ' is' 318
+
+1. the next-token guess after each block
+  block  1         ' not'  34.5%        ' now'  10.6%
+  block  2         ' not'  27.2%        ' now'  22.4%
+  block  3         ' now'  35.2%        ' not'  16.6%
+  block  4         ' now'  51.2%       ' also'  13.5%
+  block  5         ' now'  57.7%        ' not'   7.8%
+  block  6         ' now'  52.7%      ' still'   8.4%
+  block  7         ' now'  50.4%        ' not'  10.3%
+  block  8         ' now'  62.5%       ' also'   7.9%
+  block  9     ' located'  40.1%        ' now'  34.0%
+  block 10      ' Poland'  87.2%     ' Warsaw'   5.6%
+  block 11      ' Warsaw'  43.1%     ' Poland'  39.5%
+  block 12      ' Warsaw'  10.3%        ' the'   9.1%
+
+2. where ' Warsaw' comes from: its probability after each step
+  block   after attention   after feed-forward
+      1             0.0%                0.0%
+      2             0.0%                0.0%
+      3             0.0%                0.0%
+      4             0.0%                0.0%
+      5             0.0%                0.0%
+      6             0.0%                0.0%
+      7             0.0%                0.0%
+      8             0.0%                0.0%
+      9             0.0%                0.0%
+     10             3.6%                5.6%
+     11            18.1%               43.1%
+     12            12.5%               10.3%
+  biggest rise: block 11's feed-forward network, +25.0 points
+
+3. attention into the last token, first token left out (it soaks up spare attention)
+  block  1   head  2 puts 0.977 on ' is'
+  block  2   head 12 puts 0.855 on ' is'
+  block  3   head 10 puts 0.477 on ' Poland'
+  block  4   head 12 puts 0.852 on ' capital'
+  block  5   head 12 puts 1.000 on ' Poland'
+  block  6   head  8 puts 0.455 on ' capital'
+  block  7   head  2 puts 0.348 on ' of'
+  block  8   head  9 puts 0.294 on ' capital'
+  block  9   head  8 puts 0.294 on ' is'
+  block 10   head  9 puts 0.837 on ' Poland'
+  block 11   head  1 puts 0.561 on ' Poland'
+  block 12   head 11 puts 0.505 on ' Poland'
+
+4. check: switch off block 11's feed-forward network and run again
+  ' Warsaw' 10.3% -> 2.6%, top guess becomes ' the' at 9.9%
+```
+
+" Warsaw" barely registers until block 10, rises most in block 11's feed-forward network, and falls to 2.6 percent when that network is switched off. The prompt never says Warsaw, so the capital comes from what GPT-2 learned in training.
+
+## On your own prompt and model
+
+    python3 transformer_xray.py "Your prompt" --model Qwen/Qwen2.5-0.5B
+    python3 transformer_xray.py "Your prompt" --top 3 --no-ablate
+
+The guess after each block is read by sending that block's output through the model's final layer. Attention lists leave out the first token, which soaks up attention a head has nowhere else to put.
+
+## Also in the repo: kv_cache.py
+
+How much GPU memory each token of a conversation takes, read from a model's config.json, counted block by block (shared key-value heads, compressed latents, sliding-window blocks and Mamba blocks each as they are):
+
+```
+python3 kv_cache.py fixtures/deepseek-v3.json
+```
+
+```
+kv_cache · deepseek-v3.json (deepseek_v3)
 blocks        61 blocks, 7,168 wide, 128 query heads, keys and values compressed to 576 numbers per token
 window        163,840 tokens
 weights       not counted for this layout (mixture of experts or hybrid); the cache below still is
@@ -29,64 +97,14 @@ cache         70,272 bytes per token (bfloat16); the full-heads formula says 4,9
               11.51 GB for one conversation at the full window
 ```
 
-Check it by hand: (512 + 64) numbers x 61 blocks x 2 bytes = 70,272 bytes per token.
-
-The request from an OpenAI forum report, 1,750 tokens of messages with 8,100 reserved for the answer, on Llama 3 70B's 8,192-token window:
-
-```
-python3 transformer_xray.py fixtures/llama-3-70b.json --tokens 1750 --answer 8100
-```
-
-```
-transformer_xray · llama-3-70b.json (llama)
-blocks        80 blocks, 8,192 wide, 64 query heads sharing 8 key-value heads
-window        8,192 tokens
-weights       70,553,706,496 (feed-forward 79.9%, attention 17.1%, token tables 3.0%); 141.11 GB in bfloat16
-cache         327,680 bytes per token (bfloat16); the full-heads formula says 2,621,440, 8.0 times too much
-              2.68 GB for one conversation at the full window
-prompt        1,750 tokens (given)
-              0.57 GB of cache, 1,532,125 attention scores per head per full block
-fits          NO: 1,750 prompt + 8,100 answer = 9,850, over the 8,192-token window by 1,658
-```
-
-Gemma 2 9B on a 24 GB card, at its full window:
-
-```
-python3 transformer_xray.py fixtures/gemma-2-9b.json --tokens 8192 --gpu-gb 24
-```
-
-```
-transformer_xray · gemma-2-9b.json (gemma2)
-blocks        42 blocks, 3,584 wide, 16 query heads sharing 8 key-value heads
-              of 42: 21 read the whole context, 21 read the last 4,096 tokens
-window        8,192 tokens
-weights       9,241,705,984 (feed-forward 70.1%, attention 20.0%, token tables 9.9%); 18.48 GB in bfloat16
-cache         344,064 bytes per token (bfloat16); the full-heads formula says 688,128, 2.0 times too much
-              2.11 GB for one conversation at the full window
-prompt        8,192 tokens (given)
-              2.11 GB of cache, 33,558,528 attention scores per head per full block
-fits          yes: 8,192 of 8,192 tokens, 0 to spare
-gpu           24 GB minus 18.48 GB of weights leaves 5.52 GB: 2 conversations of 8,192 tokens fit
-```
-
-## On your own model
-
-Pass the config.json, the folder that holds it, or a public hub id (`openai-community/gpt2`). A gated model's config has to be downloaded first. For an exact token count, `pip install tokenizers` and put the model's tokenizer.json beside the config; without it the prompt count is an estimate at 4 characters per token, and the output says so.
-
-## What it counts, and what it does not
-
-- **Cache:** per block, 2 x key-value heads x head size for full and sliding blocks (sliding blocks stop at their window), the latent size for compressed-latent blocks, nothing for Mamba blocks, whose state stays a fixed size.
-- **Weights:** exact for GPT-2 and for dense Llama, Mistral, Qwen 2 and 3, and Gemma layouts. Mixture-of-experts and hybrid layouts are not counted, and the output says so instead of guessing.
-- **Not counted:** activations, the serving engine's own overhead, and the cache block rounding engines like vLLM add. Treat the conversation count as a ceiling.
+Standard-library Python. See `python3 kv_cache.py --help`.
 
 ## Tests
 
-    python3 -m unittest test_transformer_xray -v
+    python3 -m unittest test_transformer_xray test_kv_cache -v
 
-Each test is a number you can rebuild by hand from the config: GPT-2's 124,439,808 weights match the tensor count of its weights file, Llama 3 70B's cache is 2 x 80 x 8 x 128 x 2 bytes per token.
+The GPT-2 test checks the numbers above: " Warsaw" at 10.3 percent, the biggest rise in block 11's feed-forward network, 2.6 percent with it switched off, and block 10's head 9 putting 0.837 on " Poland".
 
 ## Support
 
-Tested 2026-10-21. Supported through 2027-10. Issues and pull requests welcome.
-
-MIT License.
+Tested 2026-10-21. Supported through 2027-10. Issues and pull requests welcome. MIT License.

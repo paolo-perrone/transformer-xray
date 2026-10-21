@@ -5,12 +5,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.9", "3.12", "3.13"]
+        python: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m unittest test_transformer_xray -v
-      - run: python transformer_xray.py fixtures/deepseek-v3.json
-      - run: python transformer_xray.py fixtures/gemma-2-9b.json --tokens 8192 --gpu-gb 24
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install transformers
+      - run: python -m unittest test_transformer_xray test_kv_cache -v
+      - run: python transformer_xray.py "The capital of Poland is"
+      - run: python kv_cache.py fixtures/deepseek-v3.json
