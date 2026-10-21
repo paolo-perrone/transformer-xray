@@ -2,7 +2,7 @@
 
 > Tested on 5 shipped config.json files (GPT-2, Llama 3 70B, Gemma 2 9B, DeepSeek-V3, Granite 4.0-H Small) on 2026-10-21 with Python 3.14; CI runs 3.9, 3.12 and 3.13. Weight totals match the published counts for the 3 dense models. Not yet run on a mixture-of-experts weight count, which it declines to guess.
 
-Companion to What is a Transformer?, an issue of [The AI Engineer](https://theaiengineer.substack.com).
+Companion to [What is a Transformer?](https://theaiengineer.substack.com/p/what-is-a-transformer), The AI Engineer.
 
 For engineers who serve or call a language model and need to know, before the bill or the out-of-memory error, how much GPU memory each conversation takes and whether a prompt fits.
 
