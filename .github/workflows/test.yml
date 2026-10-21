@@ -1,0 +1,16 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest test_transformer_xray -v
+      - run: python transformer_xray.py fixtures/deepseek-v3.json
+      - run: python transformer_xray.py fixtures/gemma-2-9b.json --tokens 8192 --gpu-gb 24
